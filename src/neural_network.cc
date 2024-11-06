@@ -1,16 +1,12 @@
 #include <iostream>
-#include <cmath>
-#include <array>
-#include <numeric>
 #include <random>
-#include <algorithm>
 
 #include <Eigen/Eigen>
 
 #include "functions.hh"
 
 
-using std::array, std::inner_product, std::function, std::cout;
+using std::cout;
 
 template<int Size>
 using Vector = Eigen::Vector<float, Size>;
