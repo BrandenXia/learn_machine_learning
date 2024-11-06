@@ -1,19 +1,22 @@
 #include <iostream>
 #include <cmath>
-#include <type_traits>
 #include <array>
 #include <numeric>
 #include <random>
 #include <algorithm>
-#include <ranges>
+
+#include <Eigen/Eigen>
 
 #include "functions.hh"
-#include "stats.hh"
-#include "linear_algebra.hh"
 
 
 using std::array, std::inner_product, std::function, std::cout;
-using LinearAlgebra::Vector;
+
+template<int Size>
+using Vector = Eigen::Vector<float, Size>;
+
+template<int SizeX, int SizeY>
+using Matrix = Eigen::Matrix<float, SizeX, SizeY>;
 
 namespace NeuralNetwork {
     class Activation {
@@ -21,6 +24,16 @@ namespace NeuralNetwork {
         virtual float operator()(float x) = 0;
 
         virtual float derivative(float x) = 0;
+
+        template<int Size>
+        Vector<Size> operator()(const Vector<Size> &x) {
+            return x.unaryExpr([this](float x) { return (*this)(x); });
+        }
+
+        template<int Size>
+        Vector<Size> derivative(const Vector<Size> &x) {
+            return x.unaryExpr([this](float x) { return derivative(x); });
+        }
 
         virtual ~Activation() = default;
     };
@@ -32,11 +45,11 @@ namespace NeuralNetwork {
         constexpr float derivative(float x) final { return Functions::sigmoid_derivative(x); }
     };
 
-    template<size_t Input, size_t Output>
+    template<int Input, int Output>
     class Layer {
     public:
         std::shared_ptr<Activation> activation;
-        array<Vector<Input>, Output> weights;
+        Matrix<Output, Input> weights;
         Vector<Output> biases;
 
         explicit Layer(std::shared_ptr<Activation> acf = std::make_shared<Sigmoid>())
@@ -47,33 +60,19 @@ namespace NeuralNetwork {
 
             // xavier initialization for weights
             float xavier = std::sqrt(6.0f / (Input + Output));
-            for (auto &w: weights) {
-                for (auto &w_i: w) {
-                    w_i = dist(gen) * 2 * xavier - xavier;
-                }
-            }
+            weights = Matrix<Output, Input>::NullaryExpr(
+                    [xavier, &dist, &gen]() { return dist(gen) * 2 * xavier - xavier; });
 
             // random initialization for biases
-            for (auto &b: biases) { b = dist(gen); }
+            biases = Vector<Output>::NullaryExpr([&dist, &gen]() { return dist(gen); });
         }
 
         Vector<Output> sum(const Vector<Input> &inputs) {
-            Vector<Output> outputs{};
-
-            std::transform(
-                    weights.begin(), weights.end(), biases.begin(), outputs.begin(),
-                    [inputs](const auto &w, float &b) { return w.dot(inputs) + b; }
-            );
-
-            return outputs;
+            return weights * inputs + biases;
         }
 
         Vector<Output> activate(const Vector<Output> &sums) {
-            Vector<Output> outputs{};
-            std::transform(sums.begin(), sums.end(), outputs.begin(), [this](const auto &s) {
-                return (*activation)(s);
-            });
-            return outputs;
+            return sums.unaryExpr([this](float x) { return (*activation)(x); });
         }
 
         Vector<Output> operator()(const Vector<Input> &inputs) {
@@ -81,7 +80,7 @@ namespace NeuralNetwork {
         }
     };
 
-    template<size_t Input, size_t Hidden, size_t Output> requires (Input > 0, Hidden > 0)
+    template<int Input, int Hidden, int Output> requires (Input > 0, Hidden > 0)
     class NeuralNetwork {
     public:
         NeuralNetwork() : hidden_layer(), output_layer() {}
@@ -90,71 +89,47 @@ namespace NeuralNetwork {
             return output_layer(hidden_layer(inputs));
         }
 
-        template<size_t Size>
-        void epoch(const array<Vector<Input>, Size> &data, const array<Vector<Output>, Size> &labels) {
+        template<int Size>
+        void epoch(const Matrix<Input, Size>
+                   &data, const Matrix<Output, Size> &labels) {
             for (int i = 0; i < Size; ++i) {
-                auto sum_h = hidden_layer.sum(data[i]);
+                auto sum_h = hidden_layer.sum(data.col(i));
                 auto h = hidden_layer.activate(sum_h);
 
                 auto sum_o = output_layer.sum(h);
                 auto o = output_layer.activate(sum_o);
 
                 // backpropagation
-                Vector<Output> d_L_d_o = (labels[i] - o) * -2;
+                Vector<Output> d_L_d_o = (labels.col(i) - o) * -2;
 
                 // output layer
-                Vector<Output> d_o_d_b{};
-                std::transform(
-                        sum_o.begin(), sum_o.end(), d_o_d_b.begin(),
-                        [this](const auto &s) { return output_layer.activation->derivative(s); }
-                );
-                array<Vector<Hidden>, Output> d_o_d_w{};
-                std::transform(
-                        d_o_d_b.begin(), d_o_d_b.end(), d_o_d_w.begin(),
-                        [h](const auto &d_o_d_b_i) { return h * d_o_d_b_i; }
-                );
-                array<Vector<Hidden>, Output> d_o_d_h{};
-                std::transform(
-                        output_layer.weights.begin(), output_layer.weights.end(),
-                        d_o_d_b.begin(), d_o_d_h.begin(), std::multiplies{}
-                );
+                Vector<Output> d_o_d_b = output_layer.activation->derivative(sum_o);
+                Matrix<Output, Hidden> d_o_d_w = h * d_o_d_b;
+                Vector<Hidden> d_o_d_h = output_layer.weights.transpose() * d_L_d_o;
 
                 // hidden layer
-                Vector<Hidden> d_h_d_b{};
-                std::transform(
-                        sum_h.begin(), sum_h.end(), d_h_d_b.begin(),
-                        [this](const auto &s) { return hidden_layer.activation->derivative(s); }
-                );
-                array<Vector<Input>, Hidden> d_h_d_w{};
-                std::transform(
-                        d_h_d_b.begin(), d_h_d_b.end(), d_h_d_w.begin(),
-                        [data_i = data[i]](const auto &d_h_d_b_i) { return data_i * d_h_d_b_i; }
-                );
+                Vector<Hidden> d_h_d_b = hidden_layer.activation->derivative(sum_h);
+                Matrix<Hidden, Input> d_h_d_w = Matrix<Hidden, Input>::Zero();
+                for (int j = 0; j < Input; ++j) {
+                    d_h_d_w.col(j) = data.col(i) * d_h_d_b[j];
+                }
 
                 // update weights and biases
                 for (int j = 0; j < Output; ++j) {
-                    auto o_j = d_L_d_o[j];
-
-                    output_layer.biases[j] -= learning_rate * o_j * d_o_d_b[j];
-                    for (int k = 0; k < Hidden; ++k) {
-                        output_layer.weights[j][k] -= learning_rate * o_j * d_o_d_w[j][k];
-                    }
-
-                    for (int k = 0; k < Hidden; ++k) {
-                        auto h_k = d_o_d_h[j][k];
-
-                        hidden_layer.biases[k] -= learning_rate * o_j * h_k * d_h_d_b[k];
-                        for (int l = 0; l < Input; ++l) {
-                            hidden_layer.weights[k][l] -= learning_rate * o_j * h_k * d_h_d_w[k][l];
-                        }
-                    }
+                    output_layer.biases[j] -= learning_rate * d_L_d_o[j] * d_o_d_b[j];
+                    output_layer.weights.row(j) -= learning_rate * d_L_d_o[j] * d_o_d_w.row(j);
+                }
+                for (int j = 0; j < Hidden; ++j) {
+                    hidden_layer.biases[j] -= learning_rate * d_o_d_h[j] * d_h_d_b[j];
+                    hidden_layer.weights.row(j) -= learning_rate * d_o_d_h[j] * d_h_d_w.row(j);
                 }
             }
         }
 
-        template<size_t Size>
-        void train(const array<Vector<Input>, Size> &data, const array<Vector<Output>, Size> &labels) {
-            for (int i = 0; i < 10000; ++i) {
+        template<int Size>
+        void train(const Matrix<Input, Size> &data, const Matrix<Output, Size> &labels,
+                   unsigned int epochs = 10000) {
+            for (int i = 0; i < epochs; ++i) {
                 epoch(data, labels);
 
                 if (i % 10 != 0) continue;
@@ -162,22 +137,18 @@ namespace NeuralNetwork {
             }
         }
 
-        template<size_t Size>
-        void loss(const array<Vector<Input>, Size> &data, const array<Vector<Output>, Size> &labels) {
-            auto prediction = predict(data);
-            for (int j = 0; j < Output; ++j) {
-                auto label_i = labels | std::views::transform([j](const auto &l) { return l[j]; });
-                auto prediction_i = prediction | std::views::transform([j](const auto &p) { return p[j]; });
-
-                auto loss = Stats::mse_loss(label_i, prediction_i);
-                cout << "Loss: " << loss << '\n';
-            }
+        template<int Size>
+        void loss(const Matrix<Input, Size> &data, const Matrix<Output, Size> &labels) {
+            // mean squared error
+            auto predictions = predict(data);
+            auto mse = (labels - predictions).array().square().sum() / Size;
+            cout << "MSE: " << mse << '\n';
         }
 
-        template<size_t Size>
-        array<Vector<Output>, Size> predict(const array<Vector<Input>, Size> &data) {
-            array<Vector<Output>, Size> predictions{};
-            std::transform(data.begin(), data.end(), predictions.begin(), [this](const auto &d) { return (*this)(d); });
+        template<int Size>
+        Matrix<Output, Size> predict(const Matrix<Input, Size> &data) {
+            Matrix<Output, Size> predictions;
+            for (int i = 0; i < Size; ++i) { predictions.col(i) = (*this)(data.col(i)); }
             return predictions;
         }
 
@@ -193,9 +164,12 @@ int main() {
 
     NeuralNetwork<2, 2, 1> nn;
 
-    array<Vector<2>, 4> data = {{{0, 0}, {0, 1}, {1, 0}, {1, 1}}};
+    Matrix<2, 4> data;
+    data << 0, 0, 1, 1,
+            0, 1, 0, 1;
 
-    array<Vector<1>, 4> labels = {{{0}, {1}, {1}, {0}}};
+    Matrix<1, 4> labels;
+    labels << 0, 1, 1, 0;
 
     nn.train(data, labels);
 
